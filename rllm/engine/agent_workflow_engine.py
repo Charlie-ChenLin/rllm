@@ -244,6 +244,7 @@ class AgentWorkflowEngine:
         termination_reasons = []
         metrics = []
         multi_modal_inputs_list = []
+        rollout_log_probs_list = []
 
         for i, episode in enumerate(episodes):
             total_steps = 0
@@ -294,6 +295,9 @@ class AgentWorkflowEngine:
                         traj_mask.append(mask)
                         multi_modal_inputs_list.append(step.model_output.multi_modal_inputs or {})
 
+                        logprobs = torch.tensor(step.model_output.logprobs, dtype=torch.float32)
+                        rollout_log_probs_list.append(logprobs)
+
                     else:
                         chat_completions = trajectory.steps[0].chat_completions
                         prompt, response, mask = self.rollout_engine.chat_parser.tokenize_and_mask(chat_completions)
@@ -318,6 +322,9 @@ class AgentWorkflowEngine:
                             mask = torch.ones_like(response_ids, dtype=torch.long)
                             traj_mask.append(mask)
                             multi_modal_inputs_list.append(step.model_output.multi_modal_inputs or {})
+
+                            logprobs = torch.tensor(step.model_output.logprobs, dtype=torch.float32)
+                            rollout_log_probs_list.append(logprobs)
 
                         else:
                             chat_completions = step.chat_completions
@@ -399,6 +406,16 @@ class AgentWorkflowEngine:
                 traj_rewards_batch[i, resp_len - 1] = traj_reward
                 step_rewards_batch[i, resp_len - 1] = step_reward
 
+        rollout_log_probs_batch = None
+        if rollout_log_probs_list:
+            rollout_log_probs_batch = torch.nn.utils.rnn.pad_sequence(
+                rollout_log_probs_list,
+                batch_first=True,
+                padding_value=0.0,
+            )
+            rollout_log_probs_batch = pad_sequence_to_length(rollout_log_probs_batch, max_response_length, 0.0, left_pad=False)
+            rollout_log_probs_batch = rollout_log_probs_batch[:, :max_response_length]
+
         # compact filtering
         cf = self.config.rllm.compact_filtering
         is_valid = [True] * len(episode_ids)
@@ -425,17 +442,22 @@ class AgentWorkflowEngine:
         if any(mm_inputs is not None for mm_inputs in multi_modal_inputs_list):
             non_tensors["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
+        tensors = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "prompts": prompts_batch,
+            "responses": response_batch,
+            "response_mask": traj_mask,
+            "traj_rewards": traj_rewards_batch,
+            "step_rewards": step_rewards_batch,
+        }
+
+        if rollout_log_probs_batch is not None:
+            tensors["rollout_log_probs"] = rollout_log_probs_batch
+
         return DataProto.from_dict(
-            tensors={
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "prompts": prompts_batch,
-                "responses": response_batch,
-                "response_mask": traj_mask,
-                "traj_rewards": traj_rewards_batch,
-                "step_rewards": step_rewards_batch,
-            },
+            tensors=tensors,
             non_tensors=non_tensors,
             meta_info={
                 "repeat_counts": repeat_counts,
